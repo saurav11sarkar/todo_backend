@@ -14,7 +14,8 @@
     "sourceMap": true,
     "outDir": "./dist",
     "paths": {
-      "src/*": ["./src/*"]
+      "src/*": ["./src/*"],
+      "prisma/generated/prisma/*": ["./prisma/generated/prisma/*"]
     },
     "incremental": true,
     "skipLibCheck": true,
