@@ -1,3 +1,5 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
+/* eslint-disable no-useless-escape */
 /* eslint-disable @typescript-eslint/no-unnecessary-type-assertion */
 import { Injectable, Logger } from '@nestjs/common';
 import Twilio from 'twilio';
@@ -30,27 +32,81 @@ export class WhatsappOrSmsService {
   isEnabled(): boolean {
     return Boolean(
       config.twilio.enabled &&
-        config.twilio.sid &&
-        config.twilio.token &&
-        ((config.twilio.whatsappEnabled && config.twilio.whatsappNumber) ||
-          (config.twilio.smsEnabled &&
-            (config.twilio.phoneNumber ||
-              config.twilio.messagingServiceSid))),
+      config.twilio.sid &&
+      config.twilio.token &&
+      ((config.twilio.whatsappEnabled && config.twilio.whatsappNumber) ||
+        (config.twilio.smsEnabled &&
+          (config.twilio.phoneNumber || config.twilio.messagingServiceSid))),
     );
   }
 
   /**
-   * Bangladesh number normalize: 01XXXXXXXXX → +8801XXXXXXXXX
-   * Also handles: 1XXXXXXXXX, 880XXXXXXXXX, +880XXXXXXXXX
+   * Smart international phone number formatter.
+   *
+   * Supports:
+   *   - Bangladesh (+880): 01XXXXXXXXX, 8801XXXXXXXXX, +8801XXXXXXXXX
+   *   - India (+91):       9XXXXXXXXX, 919XXXXXXXXX, +919XXXXXXXXX
+   *   - Any number already starting with + → returned as-is
+   *
+   * Examples:
+   *   +919609745594  → +919609745594  (already valid)
+   *   919609745594   → +919609745594
+   *   9609745594     → +919609745594
+   *   01711111111    → +8801711111111
+   *   8801711111111  → +8801711111111
+   */
+  formatPhoneNumber(number: string): string {
+    if (!number) return '';
+
+    // Remove spaces, dashes, parentheses
+    const cleaned = number.replace(/[\s\-\(\)]/g, '');
+
+    // Already has + prefix → return as-is (trust the caller)
+    if (cleaned.startsWith('+')) return cleaned;
+
+    // ── India: starts with 91 + 10 digit number (total 12 digits) ──
+    // e.g. 919609745594 → +919609745594
+    if (/^91[6-9]\d{9}$/.test(cleaned)) {
+      return `+${cleaned}`;
+    }
+
+    // ── India: bare 10-digit mobile number starting with 6-9 ──
+    // e.g. 9609745594 → +919609745594
+    if (/^[6-9]\d{9}$/.test(cleaned)) {
+      return `+91${cleaned}`;
+    }
+
+    // ── Bangladesh: starts with 880 ──
+    // e.g. 8801711111111 → +8801711111111
+    if (cleaned.startsWith('880')) {
+      return `+${cleaned}`;
+    }
+
+    // ── Bangladesh: starts with 0 (local format) ──
+    // e.g. 01711111111 → +8801711111111
+    if (cleaned.startsWith('0') && cleaned.length === 11) {
+      return `+880${cleaned.slice(1)}`;
+    }
+
+    // ── Bangladesh: bare 10-digit starting with 1 (after country code) ──
+    // e.g. 1711111111 → +8801711111111
+    if (/^1[3-9]\d{8}$/.test(cleaned)) {
+      return `+880${cleaned}`;
+    }
+
+    // Fallback: return with + as-is (let Twilio validate)
+    this.logger.warn(
+      `Could not detect country for number "${number}" → sending as "+${cleaned}"`,
+    );
+    return `+${cleaned}`;
+  }
+
+  /**
+   * @deprecated Use formatPhoneNumber() instead.
+   * Kept for backward compatibility.
    */
   formatBDNumber(number: string): string {
-    if (!number) return '';
-    const cleaned = number.replace(/[\s\-\(\)]/g, '');
-    if (cleaned.startsWith('+880')) return cleaned;
-    if (cleaned.startsWith('880')) return `+${cleaned}`;
-    if (cleaned.startsWith('0')) return `+880${cleaned.slice(1)}`;
-    if (/^1[3-9]\d{8}$/.test(cleaned)) return `+880${cleaned}`;
-    return `+880${cleaned}`;
+    return this.formatPhoneNumber(number);
   }
 
   /**
@@ -61,6 +117,7 @@ export class WhatsappOrSmsService {
    * - Destination number MUST be verified in Twilio Console → Verified Caller IDs
    * - For WhatsApp: User must join Sandbox first (send "join <keyword>" to +14155238886)
    * - For SMS to Bangladesh: Enable BD in Twilio Console → Messaging → Geo Permissions
+   * - For SMS to India: Enable IN in Twilio Console → Messaging → Geo Permissions
    */
   async sendMessage(phone: string, message: string): Promise<boolean> {
     if (!this.client) {
@@ -68,9 +125,11 @@ export class WhatsappOrSmsService {
       return false;
     }
 
-    const formattedPhone = this.formatBDNumber(phone);
-    if (!formattedPhone || formattedPhone.length < 13) {
-      this.logger.warn(`Invalid phone number: "${phone}" → "${formattedPhone}"`);
+    const formattedPhone = this.formatPhoneNumber(phone);
+    if (!formattedPhone || formattedPhone.length < 10) {
+      this.logger.warn(
+        `Invalid phone number: "${phone}" → "${formattedPhone}"`,
+      );
       return false;
     }
 
@@ -79,7 +138,9 @@ export class WhatsappOrSmsService {
     // ─── 1) Try WhatsApp ────────────────────────────────────────────
     if (config.twilio.whatsappEnabled && config.twilio.whatsappNumber) {
       try {
-        const whatsappFrom = config.twilio.whatsappNumber.startsWith('whatsapp:')
+        const whatsappFrom = config.twilio.whatsappNumber.startsWith(
+          'whatsapp:',
+        )
           ? config.twilio.whatsappNumber
           : `whatsapp:${config.twilio.whatsappNumber}`;
 
@@ -93,17 +154,12 @@ export class WhatsappOrSmsService {
           `WhatsApp message queued → SID: ${result.sid} | Status: ${result.status} | To: whatsapp:${formattedPhone}`,
         );
 
-        // Check if message was accepted (not failed immediately)
-        if (
-          result.status === 'failed' ||
-          result.status === 'undelivered'
-        ) {
+        if (result.status === 'failed' || result.status === 'undelivered') {
           this.logger.warn(
             `WhatsApp message FAILED immediately → Status: ${result.status}, Error: ${result.errorCode} ${result.errorMessage}`,
           );
           // Fall through to SMS
         } else {
-          // Status is 'queued', 'sent', 'delivered' — accepted by Twilio
           this.logger.log(`WhatsApp sent successfully to ${formattedPhone}`);
           return true;
         }
@@ -115,7 +171,6 @@ export class WhatsappOrSmsService {
           `WhatsApp FAILED for ${formattedPhone} → Code: ${errorCode} | ${errorMsg}`,
         );
 
-        // Common Twilio WhatsApp errors:
         if (errorCode === 21608) {
           this.logger.error(
             '>>> The recipient has NOT joined the WhatsApp Sandbox! ' +
@@ -126,9 +181,7 @@ export class WhatsappOrSmsService {
             '>>> Invalid "To" phone number. Check the number format.',
           );
         } else if (errorCode === 21614) {
-          this.logger.error(
-            '>>> This number is not a valid WhatsApp number.',
-          );
+          this.logger.error('>>> This number is not a valid WhatsApp number.');
         } else if (errorCode === 63032) {
           this.logger.error(
             '>>> User has not opted in to receive WhatsApp messages from this sandbox.',
@@ -171,10 +224,7 @@ export class WhatsappOrSmsService {
         `SMS message queued → SID: ${result.sid} | Status: ${result.status} | To: ${formattedPhone}`,
       );
 
-      if (
-        result.status === 'failed' ||
-        result.status === 'undelivered'
-      ) {
+      if (result.status === 'failed' || result.status === 'undelivered') {
         this.logger.error(
           `SMS FAILED → Status: ${result.status}, Error: ${result.errorCode} ${result.errorMessage}`,
         );
@@ -191,11 +241,10 @@ export class WhatsappOrSmsService {
         `SMS FAILED for ${formattedPhone} → Code: ${errorCode} | ${errorMsg}`,
       );
 
-      // Common Twilio SMS errors:
       if (errorCode === 21408) {
         this.logger.error(
-          '>>> Geographic permission not enabled for Bangladesh! ' +
-            'Go to Twilio Console → Messaging → Settings → Geo Permissions → Enable Bangladesh.',
+          '>>> Geographic permission not enabled! ' +
+            'Go to Twilio Console → Messaging → Settings → Geo Permissions → Enable the target country.',
         );
       } else if (errorCode === 21610) {
         this.logger.error(
