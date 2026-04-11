@@ -1,0 +1,24 @@
+model User {
+    id             String      @id @default(uuid())
+    email          String      @unique
+    name           String?
+    password       String
+    whatsappNumber String?
+    profilePicture String?
+    gender         Gender?
+    status         UserStatus?
+    country        String?
+    city           String?
+    address        String?
+    dateOfBirth    DateTime?
+    role           UserRole    @default(user)
+    otp            Int         @default(0)
+    otpExpires     DateTime?
+    verifiedForget Boolean     @default(false)
+    createdAt      DateTime    @default(now())
+    updatedAt      DateTime    @updatedAt
+
+    todos Todo[]
+
+    @@map("users")
+}
