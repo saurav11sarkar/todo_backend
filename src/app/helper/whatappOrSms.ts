@@ -17,6 +17,7 @@ export class WhatsappOrSmsService {
       );
       return;
     }
+    
 
     try {
       this.client = Twilio(config.twilio.sid!, config.twilio.token!);
