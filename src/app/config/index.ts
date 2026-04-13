@@ -43,6 +43,9 @@ export default {
     phoneNumber: process.env.TWILIO_PHONE_NUMBER,
     whatsappNumber: process.env.TWILIO_WHATSAPP_NUMBER,
   },
+  redis: {
+    redis_url: process.env.REDIS_URL,
+  },
 
   frontendUrl: process.env.FRONTEND_URL,
 };

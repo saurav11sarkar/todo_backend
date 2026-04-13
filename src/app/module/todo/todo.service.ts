@@ -1,4 +1,10 @@
-import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
+import {
+  HttpException,
+  HttpStatus,
+  Injectable,
+  Logger,
+  Inject,
+} from '@nestjs/common';
 import { CreateTodoDto } from './dto/create-todo.dto';
 import { UpdateTodoDto } from './dto/update-todo.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -6,15 +12,38 @@ import { IFilterParams } from 'src/app/helper/pick';
 import paginationHelper, { IOptions } from 'src/app/helper/pagenation';
 import buildWhereConditions from 'src/app/helper/buildWhereConditions';
 import { WhatsappOrSmsService } from 'src/app/helper/whatappOrSms';
+import { REDIS_CLIENT } from 'src/redis/redis.module';
+import type { RedisClientType } from 'redis';
 
 @Injectable()
 export class TodoService {
   private readonly logger = new Logger(TodoService.name);
+  private readonly TTL = 300;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly whatsappOrSms: WhatsappOrSmsService,
+    @Inject(REDIS_CLIENT) private readonly redis: RedisClientType,
   ) {}
+
+  private keys = {
+    todo: (userId: string, id: string) => `todo:${userId}:${id}`,
+    list: (userId: string) => `todos:${userId}:*`,
+  };
+
+  private async getCache<T = any>(key: string): Promise<T | null> {
+    const cached = await this.redis.get(key);
+    return cached ? JSON.parse(cached) : null;
+  }
+
+  private async setCache(key: string, value: any): Promise<void> {
+    await this.redis.setEx(key, this.TTL, JSON.stringify(value));
+  }
+
+  private async invalidateUserCache(userId: string): Promise<void> {
+    const keys = await this.redis.keys(`todos:${userId}:*`);
+    if (keys.length) await this.redis.del(keys);
+  }
 
   async getUser(userId: string) {
     return this.prisma.user.findUnique({ where: { id: userId } });
@@ -33,6 +62,8 @@ export class TodoService {
 
     if (!result)
       throw new HttpException('Todo not created', HttpStatus.BAD_REQUEST);
+
+    await this.invalidateUserCache(userId);
     return result;
   }
 
@@ -41,6 +72,11 @@ export class TodoService {
     if (!user) throw new HttpException('User is not found', 404);
 
     const { limit, page, skip, sortBy, sortOrder } = paginationHelper(options);
+    const cacheKey = `todos:${userId}:${page}:${limit}`;
+
+    const cached = await this.getCache(cacheKey);
+    if (cached) return cached;
+
     const whenCondition = buildWhereConditions(
       params,
       ['title', 'description'],
@@ -57,13 +93,22 @@ export class TodoService {
       this.prisma.todo.count({ where: whenCondition }),
     ]);
 
-    return { data: result, meta: { total, page, limit } };
+    const data = { data: result, meta: { total, page, limit } };
+    await this.setCache(cacheKey, data);
+    return data;
   }
 
   async findOne(userId: string, id: string) {
+    const cacheKey = this.keys.todo(userId, id);
+
+    const cached = await this.getCache(cacheKey);
+    if (cached) return cached;
+
     const result = await this.prisma.todo.findFirst({ where: { id, userId } });
     if (!result)
       throw new HttpException('Todo not found', HttpStatus.NOT_FOUND);
+
+    await this.setCache(cacheKey, result);
     return result;
   }
 
@@ -92,14 +137,16 @@ export class TodoService {
         ...(dto.isComplete !== undefined && { isComplete: dto.isComplete }),
         ...(dto.deadline !== undefined && { deadline: new Date(dto.deadline) }),
         completedAt,
-        ...(deadlineChanged && { whatsappNotified: false, reminderSent: false }),
+        ...(deadlineChanged && {
+          whatsappNotified: false,
+          reminderSent: false,
+        }),
       },
     });
 
     if (!result)
       throw new HttpException('Todo not updated', HttpStatus.BAD_REQUEST);
 
-    // Send completion message (WhatsApp → SMS fallback)
     if (
       isNowCompleting &&
       user.whatsappNumber &&
@@ -110,6 +157,8 @@ export class TodoService {
       this.logger.log(`✅ Completion message sent for: "${result.title}"`);
     }
 
+    await this.redis.del(this.keys.todo(userId, id));
+    await this.invalidateUserCache(userId);
     return result;
   }
 
@@ -118,10 +167,12 @@ export class TodoService {
     const result = await this.prisma.todo.delete({ where: { id } });
     if (!result)
       throw new HttpException('Todo not deleted', HttpStatus.BAD_REQUEST);
+
+    await this.redis.del(this.keys.todo(userId, id));
+    await this.invalidateUserCache(userId);
     return result;
   }
 
-  // Called by scheduler — overdue tasks
   async findOverdueTodos() {
     const now = new Date();
     return this.prisma.todo.findMany({
@@ -134,7 +185,6 @@ export class TodoService {
     });
   }
 
-  // Called by scheduler — upcoming tasks (e.g. 30 min warning)
   async findUpcomingTodos(minutesAhead: number) {
     const now = new Date();
     const future = new Date(now.getTime() + minutesAhead * 60 * 1000);
@@ -164,10 +214,6 @@ export class TodoService {
     });
   }
 
-  /**
-   * Reset notification flags for all incomplete overdue tasks of a user.
-   * This allows the scheduler to re-send notifications.
-   */
   async resetNotifications(userId: string): Promise<number> {
     const result = await this.prisma.todo.updateMany({
       where: {
