@@ -10,7 +10,8 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     networks:
       - app_network
 
@@ -18,11 +19,29 @@ services:
     image: redis:7-alpine
     container_name: redis
     restart: unless-stopped
+    # Persistence (AOF) + optional password
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     networks:
       - app_network
 
 networks:
   app_network:
     driver: bridge
+
+volumes:
+  redis_data:
