@@ -1,10 +1,4 @@
-import {
-  HttpException,
-  HttpStatus,
-  Injectable,
-  Logger,
-  Inject,
-} from '@nestjs/common';
+import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { CreateTodoDto } from './dto/create-todo.dto';
 import { UpdateTodoDto } from './dto/update-todo.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -12,38 +6,26 @@ import { IFilterParams } from 'src/app/helper/pick';
 import paginationHelper, { IOptions } from 'src/app/helper/pagenation';
 import buildWhereConditions from 'src/app/helper/buildWhereConditions';
 import { WhatsappOrSmsService } from 'src/app/helper/whatappOrSms';
-import { REDIS_CLIENT } from 'src/redis/redis.module';
-import type { RedisClientType } from 'redis';
+import { CacheService } from 'src/redis/cache.service';
 
 @Injectable()
 export class TodoService {
   private readonly logger = new Logger(TodoService.name);
   private readonly TTL = 300;
 
+  // Centralized key builders → easy to read, easy to invalidate.
+  private keys = {
+    one: (userId: string, id: string) => `todo:${userId}:${id}`,
+    list: (userId: string, page: number, limit: number) =>
+      `todos:${userId}:${page}:${limit}`,
+    allOfUser: (userId: string) => `todos:${userId}:*`,
+  };
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly whatsappOrSms: WhatsappOrSmsService,
-    @Inject(REDIS_CLIENT) private readonly redis: RedisClientType,
+    private readonly cache: CacheService,
   ) {}
-
-  private keys = {
-    todo: (userId: string, id: string) => `todo:${userId}:${id}`,
-    list: (userId: string) => `todos:${userId}:*`,
-  };
-
-  private async getCache<T = any>(key: string): Promise<T | null> {
-    const cached = await this.redis.get(key);
-    return cached ? JSON.parse(cached) : null;
-  }
-
-  private async setCache(key: string, value: any): Promise<void> {
-    await this.redis.setEx(key, this.TTL, JSON.stringify(value));
-  }
-
-  private async invalidateUserCache(userId: string): Promise<void> {
-    const keys = await this.redis.keys(`todos:${userId}:*`);
-    if (keys.length) await this.redis.del(keys);
-  }
 
   async getUser(userId: string) {
     return this.prisma.user.findUnique({ where: { id: userId } });
@@ -63,7 +45,8 @@ export class TodoService {
     if (!result)
       throw new HttpException('Todo not created', HttpStatus.BAD_REQUEST);
 
-    await this.invalidateUserCache(userId);
+    // New todo → user's list cache is stale, wipe it.
+    await this.cache.invalidate(this.keys.allOfUser(userId));
     return result;
   }
 
@@ -72,44 +55,47 @@ export class TodoService {
     if (!user) throw new HttpException('User is not found', 404);
 
     const { limit, page, skip, sortBy, sortOrder } = paginationHelper(options);
-    const cacheKey = `todos:${userId}:${page}:${limit}`;
+    const cacheKey = this.keys.list(userId, page, limit);
 
-    const cached = await this.getCache(cacheKey);
-    if (cached) return cached;
+    // ONE LINE caching — cache-aside pattern handled by CacheService.
+    return this.cache.wrap(
+      cacheKey,
+      async () => {
+        const whenCondition = buildWhereConditions(
+          params,
+          ['title', 'description'],
+          { userId },
+        );
 
-    const whenCondition = buildWhereConditions(
-      params,
-      ['title', 'description'],
-      { userId },
+        const [result, total] = await Promise.all([
+          this.prisma.todo.findMany({
+            where: whenCondition,
+            orderBy: { [sortBy]: sortOrder },
+            skip,
+            take: limit,
+          }),
+          this.prisma.todo.count({ where: whenCondition }),
+        ]);
+
+        return { data: result, meta: { total, page, limit } };
+      },
+      this.TTL,
     );
-
-    const [result, total] = await Promise.all([
-      this.prisma.todo.findMany({
-        where: whenCondition,
-        orderBy: { [sortBy]: sortOrder },
-        skip,
-        take: limit,
-      }),
-      this.prisma.todo.count({ where: whenCondition }),
-    ]);
-
-    const data = { data: result, meta: { total, page, limit } };
-    await this.setCache(cacheKey, data);
-    return data;
   }
 
   async findOne(userId: string, id: string) {
-    const cacheKey = this.keys.todo(userId, id);
-
-    const cached = await this.getCache(cacheKey);
-    if (cached) return cached;
-
-    const result = await this.prisma.todo.findFirst({ where: { id, userId } });
-    if (!result)
-      throw new HttpException('Todo not found', HttpStatus.NOT_FOUND);
-
-    await this.setCache(cacheKey, result);
-    return result;
+    return this.cache.wrap(
+      this.keys.one(userId, id),
+      async () => {
+        const result = await this.prisma.todo.findFirst({
+          where: { id, userId },
+        });
+        if (!result)
+          throw new HttpException('Todo not found', HttpStatus.NOT_FOUND);
+        return result;
+      },
+      this.TTL,
+    );
   }
 
   async updateTodo(userId: string, id: string, dto: UpdateTodoDto) {
@@ -157,8 +143,11 @@ export class TodoService {
       this.logger.log(`✅ Completion message sent for: "${result.title}"`);
     }
 
-    await this.redis.del(this.keys.todo(userId, id));
-    await this.invalidateUserCache(userId);
+    // Invalidate both the single todo and all list variants of this user.
+    await this.cache.invalidateMany([
+      this.keys.one(userId, id),
+      this.keys.allOfUser(userId),
+    ]);
     return result;
   }
 
@@ -168,8 +157,10 @@ export class TodoService {
     if (!result)
       throw new HttpException('Todo not deleted', HttpStatus.BAD_REQUEST);
 
-    await this.redis.del(this.keys.todo(userId, id));
-    await this.invalidateUserCache(userId);
+    await this.cache.invalidateMany([
+      this.keys.one(userId, id),
+      this.keys.allOfUser(userId),
+    ]);
     return result;
   }
 
