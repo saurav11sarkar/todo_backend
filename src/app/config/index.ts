@@ -44,7 +44,10 @@ export default {
     whatsappNumber: process.env.TWILIO_WHATSAPP_NUMBER,
   },
   redis: {
-    redis_url: process.env.REDIS_URL,
+    url: process.env.REDIS_URL || 'redis://localhost:6379',
+    password: process.env.REDIS_PASSWORD || '',
+    // App-level prefix → keys become "<prefix>:<env>:<key>"
+    prefix: process.env.REDIS_PREFIX || 'todo',
   },
 
   frontendUrl: process.env.FRONTEND_URL,
