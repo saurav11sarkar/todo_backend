@@ -40,9 +40,17 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   async login(
     @Body() createAuthDto: LoginAuthDto,
+    @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const result = await this.authService.login(createAuthDto, res);
+    // Capture caller IP for rate-limit bucket (proxy-aware fallback chain)
+    const ip =
+      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      req.ip ||
+      req.socket?.remoteAddress ||
+      'unknown';
+
+    const result = await this.authService.login(createAuthDto, res, ip);
 
     return {
       message: 'User logged in successfully',

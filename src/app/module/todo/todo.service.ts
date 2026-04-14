@@ -8,17 +8,33 @@ import buildWhereConditions from 'src/app/helper/buildWhereConditions';
 import { WhatsappOrSmsService } from 'src/app/helper/whatappOrSms';
 import { CacheService } from 'src/redis/cache.service';
 
+/**
+ * TodoService
+ * -----------
+ * Caching switched from wildcard SCAN-on-write to **tag-based invalidation**:
+ *
+ *   wrap(`todo:${userId}:${id}`,  ..., { tags: [`user:${userId}`, `todo:${id}`] })
+ *   wrap(`todos:${userId}:p:l:f`, ..., { tags: [`user:${userId}`, `todos:${userId}`] })
+ *
+ *   on write → invalidateTags([`todos:${userId}`, `todo:${id}`])
+ *
+ * No more `KEYS pattern` in production; no more SCAN sweep on every mutation.
+ * Tag-based delete is O(N members) with a single Redis SET lookup.
+ */
 @Injectable()
 export class TodoService {
   private readonly logger = new Logger(TodoService.name);
   private readonly TTL = 300;
 
-  // Centralized key builders → easy to read, easy to invalidate.
   private keys = {
     one: (userId: string, id: string) => `todo:${userId}:${id}`,
-    list: (userId: string, page: number, limit: number) =>
-      `todos:${userId}:${page}:${limit}`,
-    allOfUser: (userId: string) => `todos:${userId}:*`,
+    list: (userId: string, page: number, limit: number, fp: string) =>
+      `todos:${userId}:p${page}:l${limit}:${fp}`,
+  };
+
+  private tags = {
+    todo: (id: string) => `todo:${id}`,
+    userTodos: (userId: string) => `todos:${userId}`,
   };
 
   constructor(
@@ -45,8 +61,8 @@ export class TodoService {
     if (!result)
       throw new HttpException('Todo not created', HttpStatus.BAD_REQUEST);
 
-    // New todo → user's list cache is stale, wipe it.
-    await this.cache.invalidate(this.keys.allOfUser(userId));
+    // New todo → all paginated lists for this user are stale.
+    await this.cache.invalidateTags([this.tags.userTodos(userId)]);
     return result;
   }
 
@@ -55,18 +71,21 @@ export class TodoService {
     if (!user) throw new HttpException('User is not found', 404);
 
     const { limit, page, skip, sortBy, sortOrder } = paginationHelper(options);
-    const cacheKey = this.keys.list(userId, page, limit);
+    // Fingerprint of filters → unique cache key per filter combo
+    const fp = Buffer.from(
+      JSON.stringify({ params, sortBy, sortOrder }),
+    )
+      .toString('base64url')
+      .slice(0, 20);
 
-    // ONE LINE caching — cache-aside pattern handled by CacheService.
     return this.cache.wrap(
-      cacheKey,
+      this.keys.list(userId, page, limit, fp),
       async () => {
         const whenCondition = buildWhereConditions(
           params,
           ['title', 'description'],
           { userId },
         );
-
         const [result, total] = await Promise.all([
           this.prisma.todo.findMany({
             where: whenCondition,
@@ -76,10 +95,9 @@ export class TodoService {
           }),
           this.prisma.todo.count({ where: whenCondition }),
         ]);
-
         return { data: result, meta: { total, page, limit } };
       },
-      this.TTL,
+      { ttl: this.TTL, tags: [this.tags.userTodos(userId)] },
     );
   }
 
@@ -94,7 +112,7 @@ export class TodoService {
           throw new HttpException('Todo not found', HttpStatus.NOT_FOUND);
         return result;
       },
-      this.TTL,
+      { ttl: this.TTL, tags: [this.tags.todo(id), this.tags.userTodos(userId)] },
     );
   }
 
@@ -143,10 +161,9 @@ export class TodoService {
       this.logger.log(`✅ Completion message sent for: "${result.title}"`);
     }
 
-    // Invalidate both the single todo and all list variants of this user.
-    await this.cache.invalidateMany([
-      this.keys.one(userId, id),
-      this.keys.allOfUser(userId),
+    await this.cache.invalidateTags([
+      this.tags.todo(id),
+      this.tags.userTodos(userId),
     ]);
     return result;
   }
@@ -157,9 +174,9 @@ export class TodoService {
     if (!result)
       throw new HttpException('Todo not deleted', HttpStatus.BAD_REQUEST);
 
-    await this.cache.invalidateMany([
-      this.keys.one(userId, id),
-      this.keys.allOfUser(userId),
+    await this.cache.invalidateTags([
+      this.tags.todo(id),
+      this.tags.userTodos(userId),
     ]);
     return result;
   }
